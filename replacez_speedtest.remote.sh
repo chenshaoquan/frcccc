@@ -211,29 +211,87 @@ run_once() {
         exit 1
     fi
 
+    # 如果原文件里已经有标记 IP，说明它此前已被改过（脏文件）。新逻辑从不写原文件，
+    # 无法自动把脏文件还原成官方版本，这里直接报错退出，避免在脏文件上继续叠加补丁。
     if grep -q "$MARKER_IP" "$TARGET_PY"; then
-        sudo python3 "$TARGET_PY" --speedtest >/dev/null 2>&1
-        return $?
+        echo "WARNING: $TARGET_PY already contains the marker ($MARKER_IP)." >&2
+        echo "It looks already patched by a previous run. Restore the clean official file first, then re-run." >&2
+        exit 1
     fi
 
-    local backup_file
-    local temp_file
-    backup_file="${TARGET_PY}.backup.$(date +%Y%m%d_%H%M%S)"
-    temp_file="$(mktemp)"
+    local temp_func
+    temp_func="$(mktemp)"
+    write_replacement_function > "$temp_func"
 
-    write_replacement_function > "$temp_file"
-    sudo cp "$TARGET_PY" "$backup_file"
-    sudo chmod 666 "$TARGET_PY"
-
-    if ! sudo python3 - "$TARGET_PY" "$temp_file" <<'PY'
+    # 单个 Python 驱动完成全部工作：
+    #   1) 读原文件，把替换函数注入到【临时副本】，原 send_mach_info.py 全程不写；
+    #   2) 先快照副作用文件（data/speedtest_mirrors 的内容/权限/属主，以及 .config / data 目录状态）；
+    #   3) 运行补丁副本（输出不吞掉，便于排查）；
+    #   4) 无论成功/失败/中断，finally 里恢复缓存文件与目录的原始状态并删除临时副本。
+    sudo python3 - "$TARGET_PY" "$temp_func" <<'PY'
+import os
 import re
+import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 target = Path(sys.argv[1])
-replacement_file = Path(sys.argv[2])
+func_file = Path(sys.argv[2])
+
+WORKDIR = Path("/var/lib/vastai_kaalia")
+MIRROR = WORKDIR / "data" / "speedtest_mirrors"
+DATA_DIR = MIRROR.parent
+CONFIG_DIR = WORKDIR / ".config"
+
+
+def snap_mirror(p: Path):
+    if p.is_symlink():
+        return {"kind": "symlink", "link": os.readlink(p)}
+    if p.exists():
+        st = p.stat()
+        return {
+            "kind": "file",
+            "data": p.read_bytes(),
+            "mode": stat.S_IMODE(st.st_mode),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+        }
+    return {"kind": "missing"}
+
+
+def restore_mirror(p: Path, snap: dict):
+    try:
+        if snap["kind"] == "missing":
+            if p.is_symlink() or p.is_file():
+                p.unlink(missing_ok=True)
+            return
+        if snap["kind"] == "symlink":
+            if p.exists() or p.is_symlink():
+                p.unlink(missing_ok=True)
+            os.symlink(snap["link"], p)
+            return
+        p.write_bytes(snap["data"])
+        os.chmod(p, snap["mode"])
+        os.chown(p, snap["uid"], snap["gid"])
+    except Exception:
+        pass
+
+
+def dir_meta(p: Path):
+    st = p.stat()
+    return stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid
+
+
+mirror_snap = snap_mirror(MIRROR)
+config_existed = CONFIG_DIR.exists()
+data_existed = DATA_DIR.exists()
+config_meta = dir_meta(CONFIG_DIR) if config_existed else None
+data_meta = dir_meta(DATA_DIR) if data_existed else None
+
+replacement = func_file.read_text(encoding="utf-8").rstrip() + "\n\n"
 text = target.read_text(encoding="utf-8")
-replacement = replacement_file.read_text(encoding="utf-8").rstrip() + "\n\n"
 
 pattern = re.compile(
     r"^def epsilon_greedyish_speedtest\(\):\n(?:(?:^[ \t].*\n)|^\n)*",
@@ -242,24 +300,58 @@ pattern = re.compile(
 updated, count = pattern.subn(replacement, text, count=1)
 if count != 1:
     print("Target function not found: def epsilon_greedyish_speedtest", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
 
-target.write_text(updated, encoding="utf-8")
+fd, tmp = tempfile.mkstemp(prefix=".send_mach_info.patched.", suffix=".py", dir=str(WORKDIR))
+os.close(fd)
+patched = Path(tmp)
+
+proc = subprocess.Popen([sys.executable, str(patched), "--speedtest"])
+rc = 1
+try:
+    rc = proc.wait()
+finally:
+    # 先确保子进程已死，再还原，避免它在我们还原后又把缓存写回去。
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    # 1) 恢复测速缓存文件（内容 + 权限 + 属主），原本不存在就删掉。
+    restore_mirror(MIRROR, mirror_snap)
+    # 2) 目录：原本存在就还原权限/属主；原本不存在就尝试删掉空目录。
+    for d, existed, meta in (
+        (DATA_DIR, data_existed, data_meta),
+        (CONFIG_DIR, config_existed, config_meta),
+    ):
+        if existed:
+            try:
+                os.chmod(d, meta[0])
+                os.chown(d, meta[1], meta[2])
+            except OSError:
+                pass
+        else:
+            try:
+                d.rmdir()  # 只删空目录，避免误删运行期间产生的其它文件
+            except OSError:
+                pass
+    # 3) 删除补丁副本。
+    try:
+        patched.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+sys.exit(rc)
 PY
-    then
-        sudo cp "$backup_file" "$TARGET_PY" >/dev/null 2>&1 || true
-        sudo chmod 755 "$TARGET_PY" >/dev/null 2>&1 || true
-        sudo rm -f "$backup_file" "$temp_file" >/dev/null 2>&1 || true
-        exit 1
-    fi
-
-    sudo chmod 755 "$TARGET_PY"
-    sudo python3 "$TARGET_PY" --speedtest >/dev/null 2>&1
     local run_code=$?
-
-    sudo cp "$backup_file" "$TARGET_PY" >/dev/null 2>&1 || true
-    sudo rm -f "$backup_file" "$temp_file" >/dev/null 2>&1 || true
-
+    rm -f "$temp_func" 2>/dev/null || true
     return $run_code
 }
 
